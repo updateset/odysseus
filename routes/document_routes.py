@@ -11,6 +11,7 @@ from sqlalchemy import case, func, or_
 from core.database import SessionLocal, Document, DocumentVersion
 from core.database import Session as DbSession
 from src.auth_helpers import get_current_user
+from src.constants import MAIL_ATTACHMENTS_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -107,10 +108,10 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             # to markdown for prose.
             language = req.language
             if not language:
-                from src.tool_implementations import _looks_like_email_document, _sniff_doc_language
+                from src.agent_tools.document_tools import _looks_like_email_document, _sniff_doc_language
                 language = _sniff_doc_language(req.content)
             else:
-                from src.tool_implementations import _looks_like_email_document
+                from src.agent_tools.document_tools import _looks_like_email_document
             if _looks_like_email_document(req.content, req.title):
                 language = "email"
 
@@ -502,7 +503,8 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
         user = get_current_user(request)
         try:
             data = await request.json()
-        except Exception:
+        except Exception as e:
+            logger.warning("Failed to parse export request body, defaulting to empty", exc_info=e)
             data = {}
         ids = data.get("ids") or []
         if not ids:
@@ -642,10 +644,10 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
                     # in-memory active-doc pointer so the last-resort injection
                     # path doesn't re-surface this doc in a later chat (#1160).
                     try:
-                        from src.tool_implementations import clear_active_document
+                        from src.agent_tools.document_tools import clear_active_document
                         clear_active_document(doc_id)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("Failed to clear active document %r on detach", doc_id, exc_info=e)
             db.commit()
             db.refresh(doc)
             return _doc_to_dict(doc)
@@ -671,7 +673,7 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             # Closed/deleted — drop the in-memory active-doc pointer so it isn't
             # re-injected into a later, unrelated chat (#1160).
             try:
-                from src.tool_implementations import clear_active_document
+                from src.agent_tools.document_tools import clear_active_document
                 clear_active_document(doc_id)
             except Exception:
                 pass
@@ -1330,6 +1332,12 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             if not pdf_path:
                 raise HTTPException(404, f"Source PDF {upload_id} not found")
 
+            # Fail fast with a clear 503 if the optional PyMuPDF dependency
+            # is missing — fill_fields/stamp_annotations will otherwise
+            # raise RuntimeError deep inside and bubble out as a 500.
+            # Mirrors the convention in _load_pdf_viewer_fitz above.
+            _load_pdf_viewer_fitz()
+
             values = parse_markdown_to_values(doc.current_content or "")
             out_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
             _to_unlink.append(out_path)
@@ -1542,10 +1550,7 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
         # don't import from a routes file (cycle-prone). Same env override
         # as email_routes (ODYSSEUS_MAIL_ATTACHMENTS_DIR).
         from pathlib import Path as _Path
-        import os as _os
-        _DATA_DIR = _Path(__file__).resolve().parent.parent / "data"
-        _BASE = _os.environ.get("ODYSSEUS_MAIL_ATTACHMENTS_DIR", str(_DATA_DIR / "mail-attachments"))
-        _COMPOSE_DIR = _Path(_BASE) / "_compose"
+        _COMPOSE_DIR = _Path(MAIL_ATTACHMENTS_DIR) / "_compose"
         _COMPOSE_DIR.mkdir(parents=True, exist_ok=True)
 
         user = get_current_user(request)

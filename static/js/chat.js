@@ -13,7 +13,6 @@ import chatStream from './chatStream.js';
 import { addAITTSButton } from './tts-ai.js';
 import markdownModule from './markdown.js';
 import { svgifyEmoji } from './markdown.js';
-import planWindowModule from './planWindow.js';
 import spinnerModule from './spinner.js';
 import presetsModule from './presets.js';
 import fileHandlerModule from './fileHandler.js';
@@ -24,6 +23,8 @@ import codeRunnerModule from './codeRunner.js';
 import slashCommands, { initSlashCommands, isCommand, handleSlashCommand, handleSetupInput, handleSetupWizard, typewriterInto } from './slashCommands.js';
 import createResearchSynapse from './researchSynapse.js';
 import { createStreamRenderer } from './streamingRenderer.js';
+import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composerArrowUpRecall.js';
+
   const RESEARCH_TIMEOUT_MS = 360000;
   const DEFAULT_TIMEOUT_MS = 120000;
   const RESEARCH_SVG = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>';
@@ -109,35 +110,6 @@ import { createStreamRenderer } from './streamingRenderer.js';
   let _streamSessionId = null; // Session ID for the currently active reader loop
   let _lastReaderActivity = 0; // Timestamp of last reader.read() success — used to detect frozen streams
   let _webLockRelease = null;  // Function to release the Web Lock held during streaming
-  let _forcePlanOff = false;   // One-shot: suppress plan_mode for the next send (Approve & Run)
-
-  // ── Plan store: the latest proposed/approved checklist for the CURRENT chat ──
-  // Kept so (a) it can be sent back each turn and pinned in context (a long plan
-  // on a weak model survives history truncation), and (b) the plan window can be
-  // re-opened/docked at any time via the plan-button menu. Stored per session in
-  // localStorage so it survives a reload mid-execution.
-  function _setStoredPlan(text) {
-    const sid = sessionModule.getCurrentSessionId();
-    if (!sid || !text || !text.trim()) return;
-    Storage.setJSON(Storage.KEYS.PLAN, { sid, text });
-    // Live-refresh the plan window if it's open (shows progress as the agent
-    // restates the checklist with [x]).
-    try {
-      if (planWindowModule.isPlanWindowOpen && planWindowModule.isPlanWindowOpen()) {
-        planWindowModule.openPlanWindow(text, null);
-      }
-    } catch (_) {}
-  }
-  function _getStoredPlan() {
-    const sid = sessionModule.getCurrentSessionId();
-    const rec = Storage.getJSON(Storage.KEYS.PLAN, null);
-    return (rec && rec.sid === sid && rec.text) ? rec.text : '';
-  }
-  // A line like "- [ ] step" / "- [x] step" marks a GitHub-style checklist.
-  const _CHECKLIST_RE = /^\s*[-*]\s+\[[ xX]\]\s+/m;
-  // Exposed for app.js (plan-button menu) — re-open the stored plan window.
-  window._getStoredPlan = _getStoredPlan;
-  window.planWindowModule = planWindowModule;
 
   /** Check if an SSE reader is still actively connected for a session. */
   function hasActiveStream(sessionId) {
@@ -217,6 +189,19 @@ import { createStreamRenderer } from './streamingRenderer.js';
       const ta = document.getElementById('message');
       if (ta && mod.initSlashAutocomplete) mod.initSlashAutocomplete(ta);
     }).catch(() => {});
+
+    // ArrowUp on empty composer recalls last user message (like many chat apps).
+    const _wireArrowUpRecall = (composer) =>
+      wireArrowUpRecall(composer, () => getLastUserMessageFromChatHistory(), {
+        autoResize: uiModule?.autoResize,
+      });
+
+    const composer = document.getElementById('message');
+    if (!_wireArrowUpRecall(composer)) {
+      // Init can run before #message exists (templated UI); short retries only.
+      try { requestAnimationFrame(() => _wireArrowUpRecall(document.getElementById('message'))); } catch (_) {}
+      setTimeout(() => _wireArrowUpRecall(document.getElementById('message')), 250);
+    }
   }
 
   // addMessage, createMsgFooter, displayMetrics, hideWelcomeScreen, showWelcomeScreen
@@ -586,6 +571,24 @@ import { createStreamRenderer } from './streamingRenderer.js';
     let timeoutId = null;
     let responseTimeoutCleared = false;
     let clearResponseTimeout = () => {};
+    let firstTokenWaitTimers = [];
+    const clearFirstTokenWaitTimers = () => {
+      firstTokenWaitTimers.forEach(t => { try { clearTimeout(t); } catch (_) {} });
+      firstTokenWaitTimers = [];
+    };
+    const scheduleFirstTokenWaitMessages = () => {
+      clearFirstTokenWaitTimers();
+      const steps = [
+        [20000, 'Still waiting for first token'],
+        [60000, 'Large local model is pre-filling context'],
+        [120000, 'Still working - no tokens yet from the model'],
+      ];
+      firstTokenWaitTimers = steps.map(([ms, text]) => setTimeout(() => {
+        if (!accumulated && spinner && spinner.element && !(currentAbort && currentAbort.signal.aborted)) {
+          spinner.updateMessage(text);
+        }
+      }, ms));
+    };
     const clearProcessingProbe = () => {
       if (processingProbeTimer) {
         clearTimeout(processingProbeTimer);
@@ -755,9 +758,11 @@ import { createStreamRenderer } from './streamingRenderer.js';
         const dismissBtn = document.createElement('button');
         dismissBtn.textContent = '\u00d7';
         dismissBtn.className = 'import-prompt-dismiss';
+        dismissBtn.setAttribute('aria-label', 'Dismiss');
+        dismissBtn.title = 'Dismiss';
         dismissBtn.addEventListener('click', () => banner.remove());
         banner.appendChild(dismissBtn);
-        const chatBar = document.getElementById('chat-bar');
+        const chatBar = document.querySelector('.chat-input-bar');
         if (chatBar) chatBar.parentNode.insertBefore(banner, chatBar);
         // Auto-dismiss after 15 seconds
         setTimeout(() => { if (banner.parentNode) banner.remove(); }, 15000);
@@ -800,6 +805,19 @@ import { createStreamRenderer } from './streamingRenderer.js';
         try { await documentModule.saveDocument({ silent: true }); } catch (_e) { /* best-effort */ }
         fd.append('active_doc_id', documentModule.getCurrentDocId());
       }
+      // Active email context — when an email reader is open, pass its
+      // uid/folder/account so "reply", "summarize", "what does this say"
+      // resolve to the email the user is actually looking at instead of
+      // making the agent invent a new markdown draft with fake headers.
+      try {
+        const getEmailCtx = window.__odysseusGetActiveEmailContext;
+        const emCtx = typeof getEmailCtx === 'function' ? getEmailCtx() : null;
+        if (emCtx && emCtx.uid) {
+          fd.append('active_email_uid', String(emCtx.uid));
+          fd.append('active_email_folder', String(emCtx.folder || 'INBOX'));
+          if (emCtx.account) fd.append('active_email_account', String(emCtx.account));
+        }
+      } catch (_e) { /* best-effort */ }
       // Web toggle: pre-search in Chat mode, tool permission in Agent mode
       const toggleState = Storage.loadToggleState();
       let isAgentMode = (toggleState.mode || 'chat') === 'agent';
@@ -815,31 +833,15 @@ import { createStreamRenderer } from './streamingRenderer.js';
         } else {
           fd.append('use_web', 'true');
         }
+      } else if (isAgentMode) {
+        fd.append('allow_web_search', 'false');
       }
       if (el('research-toggle').checked) {
         fd.append('use_research', 'true');
         // Research always runs in chat mode — override agent if set
         fd.set('mode', 'chat');
       }
-      if (el('bash-toggle').checked) {
-        fd.append('allow_bash', 'true');
-      }
-      // Plan mode: agent investigates read-only and proposes a plan to approve.
-      // Only meaningful in agent mode, and never alongside deep research.
-      // _forcePlanOff is a one-shot set by "Approve & Run" so the execution turn
-      // runs with full tools even though the Plan toggle is still on.
-      const _planToggle = el('plan-toggle');
-      const planTurn = !_forcePlanOff && isAgentMode && _planToggle && _planToggle.checked && !el('research-toggle').checked;
-      _forcePlanOff = false;
-      if (planTurn) {
-        fd.append('plan_mode', 'true');
-        fd.set('mode', 'agent');
-      } else if (isAgentMode) {
-        // Executing (not proposing): send the stored plan back so the backend
-        // pins it in context and the agent can always re-reference it.
-        const _sp = _getStoredPlan();
-        if (_sp) fd.append('approved_plan', _sp);
-      }
+      fd.append('allow_bash', el('bash-toggle').checked ? 'true' : 'false');
       const ragChk = el('rag-toggle');
       if (ragChk && !ragChk.checked) {
         fd.append('use_rag', 'false');
@@ -937,56 +939,7 @@ import { createStreamRenderer } from './streamingRenderer.js';
         setTimeout(() => spinner.updateMessage('Analyzing sources'), 1500);
       } else {
         spinner.updateMessage('Processing request');
-        const endpointUrlForProbe = sessionModule.getCurrentEndpointUrl ? sessionModule.getCurrentEndpointUrl() : null;
-        if (endpointUrlForProbe && modelName) {
-          processingProbeTimer = setTimeout(async () => {
-            processingProbeTimer = null;
-            if (accumulated || !spinner || !spinner.element || (currentAbort && currentAbort.signal.aborted)) return;
-            processingProbeAbort = new AbortController();
-            try {
-              spinner.updateMessage('Checking model endpoint');
-              const status = await _probeCurrentEndpointStatus(endpointUrlForProbe, processingProbeAbort.signal);
-              if (accumulated || !spinner || !spinner.element || (currentAbort && currentAbort.signal.aborted)) return;
-              if (!status) {
-                spinner.updateMessage('Still waiting for model');
-              } else if (status.alive) {
-                const latency = status.latency_ms ? ` (${status.latency_ms}ms)` : '';
-                spinner.updateMessage(`Endpoint online${latency}; waiting for first token`);
-              } else {
-                // Probe confirms the endpoint isn't responding. Don't
-                // sit on a hung fetch — give the user 5s to read the
-                // status, then auto-abort with reason='offline' so the
-                // catch handler shows a clean "switch model" message
-                // instead of leaving the spinner spinning forever.
-                if (status.error) console.warn('Model endpoint probe failed:', status.error);
-                let _countdown = 5;
-                spinner.updateMessage(`Endpoint offline — cancelling in ${_countdown}s`);
-                const _tick = setInterval(() => {
-                  _countdown--;
-                  if (!spinner || !spinner.element || (currentAbort && currentAbort.signal.aborted) || accumulated) {
-                    clearInterval(_tick);
-                    return;
-                  }
-                  if (_countdown > 0) {
-                    spinner.updateMessage(`Endpoint offline — cancelling in ${_countdown}s`);
-                  } else {
-                    clearInterval(_tick);
-                    if (currentAbort && !currentAbort.signal.aborted) {
-                      currentAbort._reason = 'offline';
-                      currentAbort.abort();
-                    }
-                  }
-                }, 1000);
-              }
-            } catch (e) {
-              if (e && e.name !== 'AbortError' && spinner && spinner.element && !accumulated) {
-                spinner.updateMessage('Still waiting for model');
-              }
-            } finally {
-              processingProbeAbort = null;
-            }
-          }, 10000);
-        }
+        scheduleFirstTokenWaitMessages();
       }
       
       const researchBtn = el('research-toggle-btn');
@@ -1115,7 +1068,7 @@ import { createStreamRenderer } from './streamingRenderer.js';
       let _lastToolName = '';
       const _searchIcon = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" style="vertical-align:-2px;margin-right:4px"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>';
       const _toolLabels = {
-        'web_search': _searchIcon + 'Searching',
+        'web_search': 'Searching',
         'bash': 'Running',
         'python': 'Running',
         'create_document': 'Writing',
@@ -1134,6 +1087,9 @@ import { createStreamRenderer } from './streamingRenderer.js';
         'deep_research': 'Researching',
         'list_models': 'Browsing',
         'ui_control': 'Adjusting',
+      };
+      const _toolIcons = {
+        'web_search': _searchIcon,
       };
       function _thinkingLabel() {
         if (!_lastToolName) {
@@ -1163,6 +1119,11 @@ import { createStreamRenderer } from './streamingRenderer.js';
         uiModule.scrollHistory();
       }
 
+      function _replaceThinkingSpinner(label) {
+        _removeThinkingSpinner();
+        _showThinkingSpinner(label);
+      }
+
       // Auto-show thinking spinner after text stops streaming
       let _textPauseTimer = null;
       function _scheduleThinkingSpinner() {
@@ -1186,10 +1147,24 @@ import { createStreamRenderer } from './streamingRenderer.js';
       let _liveThinkHeader = null;
       let _liveThinkSpinnerSlot = null;
       let _liveThinkTimerEl = null;
+      let _liveThinkTokenCount = 0;
       let _liveThinkToggle = null;
       let _liveThinkDomId = null;
 
+      function _estimateThinkingTokens(text) {
+        const clean = (text || '').trim();
+        if (!clean) return 0;
+        return Math.max(1, Math.ceil(clean.length / 4));
+      }
+
+      function _formatThinkStats(seconds, tokenCount) {
+        const time = seconds ? seconds + 's' : '';
+        const tokens = tokenCount ? tokenCount + ' tok' : '';
+        return time && tokens ? time + ' · ' + tokens : (time || tokens);
+      }
+
       function _replyAfterClosedThinking(text) {
+        text = markdownModule.normalizeThinkingMarkup(text || '');
         const closeRe = /<\/(?:think(?:ing)?|thought)>|<channel\|>/gi;
         let match = null;
         let last = null;
@@ -1200,7 +1175,7 @@ import { createStreamRenderer } from './streamingRenderer.js';
 
       // Direct render helper for streaming text
       _renderStream = () => {
-        let dt = stripToolBlocks(roundText);
+        let dt = markdownModule.normalizeThinkingMarkup(stripToolBlocks(roundText));
         const bodyEl = roundHolder.querySelector('.body');
         const contentEl = _ensureStreamLayout(bodyEl);
 
@@ -1290,6 +1265,12 @@ import { createStreamRenderer } from './streamingRenderer.js';
 
       let _nextIsError = false;
       let _streamSawDone = false;
+      let _firstVisibleOutputSeen = false;
+      const markFirstVisibleOutput = () => {
+        if (_firstVisibleOutputSeen) return;
+        _firstVisibleOutputSeen = true;
+        clearFirstTokenWaitTimers();
+      };
 
       while (true) {
         const { done, value } = await reader.read();
@@ -1309,6 +1290,7 @@ import { createStreamRenderer } from './streamingRenderer.js';
           }
           if (line.startsWith('data: ')) {
             const data = line.slice(6);
+            if (data && data !== '[DONE]') markFirstVisibleOutput();
 
             // (thinking spinner removal is handled in agent_step / tool_start / content handlers)
 
@@ -1370,7 +1352,7 @@ import { createStreamRenderer } from './streamingRenderer.js';
                 if (_liveThinkHeader) _liveThinkHeader.textContent = 'View thinking process';
                 if (_liveThinkSpinnerSlot) _liveThinkSpinnerSlot.remove();
                 if (_liveThinkTimerEl && _elapsedDone) {
-                  _liveThinkTimerEl.textContent = _elapsedDone + 's';
+                  _liveThinkTimerEl.textContent = _formatThinkStats(_elapsedDone, _liveThinkTokenCount);
                   _liveThinkTimerEl.style.marginLeft = 'auto';
                   _liveThinkTimerEl.style.marginRight = '5px';
                   var _hdrDone = _liveThinkTimerEl.closest('.thinking-header');
@@ -1412,9 +1394,17 @@ import { createStreamRenderer } from './streamingRenderer.js';
                 typewriterInto(roundHolder.querySelector('.body'), errMsg);
                 break;
               }
-              if (json.delta || json.type === 'tool_start' || json.type === 'tool_output' || json.type === 'tool_progress' || json.type === 'agent_step' || json.type === 'doc_stream_open' || json.type === 'doc_stream_delta' || json.type === 'research_progress') {
+              if (json.delta || json.type === 'agent_prep' || json.type === 'tool_start' || json.type === 'tool_output' || json.type === 'tool_progress' || json.type === 'agent_step' || json.type === 'doc_stream_open' || json.type === 'doc_stream_delta' || json.type === 'research_progress') {
                 clearResponseTimeout();
                 clearProcessingProbe();
+                clearFirstTokenWaitTimers();
+              }
+              if (json.type === 'agent_prep') {
+                if (!_isBg) {
+                  _cancelThinkingTimer();
+                  _replaceThinkingSpinner('Preparing agent');
+                }
+                continue;
               }
               if (json.delta) {
                 _cancelThinkingTimer();
@@ -1477,12 +1467,13 @@ import { createStreamRenderer } from './streamingRenderer.js';
                 // 1. Normal: <think>...no closing tag yet
                 // 2. Malformed: <think></think>\n...text but no second </think> yet
                 // 3. Qwen3.5: "Thinking Process:" without <think> tags
-                let hasUnclosedThink = markdownModule.hasUnclosedThinkTag(roundText);
+                const normalizedRoundText = markdownModule.normalizeThinkingMarkup(roundText);
+                let hasUnclosedThink = markdownModule.hasUnclosedThinkTag(normalizedRoundText);
                 // Detect non-tag thinking patterns: "Thinking:", "Thinking Process:", Gemma-style reasoning
                 // These patterns don't use <think> tags, so we simulate unclosed thinking during streaming
                 const _replyPrefixes = ['Hey', 'Hi ', 'Hi!', 'Hello', 'Sure', 'Yes', 'No ', 'No,', 'Yo', 'OK', 'Here', 'Absolutely', 'Of course', 'Great', 'Alright', 'Thanks', 'Welcome', 'Good ', "I'm happy", "I'd be"];
-                if (!hasUnclosedThink && !/<(?:think(?:ing)?|thought)(?:\s+[^>]*)?>|<\|channel>thought/i.test(roundText)) {
-                  const _trimmedRT = roundText.trimStart();
+                if (!hasUnclosedThink && !/<(?:think(?:ing)?|thought)(?:\s+[^>]*)?>|<\|channel>thought/i.test(normalizedRoundText)) {
+                  const _trimmedRT = normalizedRoundText.trimStart();
                   const _isReasoning = markdownModule.startsWithReasoningPrefix(_trimmedRT);
                   if (_isReasoning) {
                     // Check if we can see a reply boundary yet (newline then reply pattern)
@@ -1507,9 +1498,9 @@ import { createStreamRenderer } from './streamingRenderer.js';
                     }
                   }
                 }
-                if (!hasUnclosedThink && /^<(?:think(?:ing)?|thought)(?:\s+[^>]*)?>\s*<\/(?:think(?:ing)?|thought)>/i.test(roundText)) {
+                if (!hasUnclosedThink && /^<(?:think(?:ing)?|thought)(?:\s+[^>]*)?>\s*<\/(?:think(?:ing)?|thought)>/i.test(normalizedRoundText)) {
                   // Empty <think></think> — the model likely put thinking outside the tags
-                  const afterEmpty = roundText.replace(/^<(?:think(?:ing)?|thought)(?:\s+[^>]*)?>\s*<\/(?:think(?:ing)?|thought)>/i, '').trim();
+                  const afterEmpty = normalizedRoundText.replace(/^<(?:think(?:ing)?|thought)(?:\s+[^>]*)?>\s*<\/(?:think(?:ing)?|thought)>/i, '').trim();
                   const closeTags = (afterEmpty.match(/<\/(?:think(?:ing)?|thought)>/gi) || []).length;
                   if (closeTags === 0 && afterEmpty.length > 0) {
                     hasUnclosedThink = true; // still waiting for real closing tag
@@ -1519,10 +1510,10 @@ import { createStreamRenderer } from './streamingRenderer.js';
                 // Only applies when there's a second </think> later (model leaked thinking outside tags)
                 // Do NOT trigger if the text after </think> contains tool calls (that's real content)
                 if (!hasUnclosedThink && isThinking) {
-                  const _thinkMatch = roundText.match(/<(?:think(?:ing)?|thought)(?:\s+[^>]*)?>([\s\S]*?)<\/(?:think(?:ing)?|thought)>/i);
+                  const _thinkMatch = normalizedRoundText.match(/<(?:think(?:ing)?|thought)(?:\s+[^>]*)?>([\s\S]*?)<\/(?:think(?:ing)?|thought)>/i);
                   const _thinkLen = _thinkMatch ? _thinkMatch[1].trim().length : 0;
                   if (_thinkLen < 20) {
-                    const _afterClose = roundText.replace(/<(?:think(?:ing)?|thought)(?:\s+[^>]*)?>([\s\S]*?)<\/(?:think(?:ing)?|thought)>/i, '').trim();
+                    const _afterClose = normalizedRoundText.replace(/<(?:think(?:ing)?|thought)(?:\s+[^>]*)?>([\s\S]*?)<\/(?:think(?:ing)?|thought)>/i, '').trim();
                     // Only keep waiting if there's trailing text that looks like thinking (not tool calls)
                     const _hasToolCall = /```(?:bash|python|web_search|read_file|write_file|create_document|edit_document|manage_|generate_image)/i.test(_afterClose);
                     const _hasOrphanClose = /<\/(?:think(?:ing)?|thought)>/i.test(_afterClose);
@@ -1567,7 +1558,7 @@ import { createStreamRenderer } from './streamingRenderer.js';
                   function _tickThinkTimer() {
                     if (!_liveThinkTimerEl || !_liveThinkTimerEl.isConnected) return;
                     var s = ((Date.now() - _thinkTimerStart) / 1000).toFixed(1);
-                    _liveThinkTimerEl.textContent = s + 's';
+                    _liveThinkTimerEl.textContent = _formatThinkStats(s, _liveThinkTokenCount);
                     _thinkTimerRAF = requestAnimationFrame(_tickThinkTimer);
                   }
                   _thinkTimerRAF = requestAnimationFrame(_tickThinkTimer);
@@ -1583,16 +1574,24 @@ import { createStreamRenderer } from './streamingRenderer.js';
                 } else if (hasUnclosedThink && isThinking) {
                   if (_liveThinkInner) {
                     // Extract raw thinking text (strip known thinking wrappers and prefixes)
-                    var thinkText = roundText
+                    var thinkText = markdownModule.normalizeThinkingMarkup(roundText)
                       .replace(/<\/?(?:think(?:ing)?|thought)(?:\s+[^>]*)?>/gi, '')
                       .replace(/<\|channel>thought\s*\n?/gi, '')
                       .replace(/<\|channel>response\s*\n?/gi, '')
                       .replace(/<channel\|>/gi, '');
                     thinkText = thinkText.replace(/^\s*Thinking(?:\s+Process)?:\s*/i, '');
+                    _liveThinkTokenCount = _estimateThinkingTokens(thinkText);
                     _liveThinkInner.innerHTML = markdownModule.mdToHtml(thinkText);
-                    // Keep thinking box scrolled to bottom
+                    if (_liveThinkTimerEl) {
+                      var _elapsedLive = thinkingStartTime ? ((Date.now() - thinkingStartTime) / 1000).toFixed(1) : '';
+                      _liveThinkTimerEl.textContent = _formatThinkStats(_elapsedLive, _liveThinkTokenCount);
+                    }
+                    // Keep thinking box scrolled to bottom, but let user scroll up
                     var thinkBox = _liveThinkInner.closest('.thinking-content');
-                    if (thinkBox) thinkBox.scrollTop = thinkBox.scrollHeight;
+                    if (thinkBox) {
+                      var nearBottom = thinkBox.scrollHeight - thinkBox.clientHeight - thinkBox.scrollTop < 80;
+                      if (nearBottom) thinkBox.scrollTop = thinkBox.scrollHeight;
+                    }
                   }
                   uiModule.scrollHistory();
                   continue;
@@ -1610,6 +1609,7 @@ import { createStreamRenderer } from './streamingRenderer.js';
                     _liveThinkHeader = null;
                     _liveThinkSpinnerSlot = null;
                     _liveThinkTimerEl = null;
+                    _liveThinkTokenCount = 0;
                     _liveThinkToggle = null;
                     _liveThinkDomId = null;
                     // Fall through to normal streaming
@@ -1632,7 +1632,7 @@ import { createStreamRenderer } from './streamingRenderer.js';
                   if (_liveThinkSpinnerSlot) _liveThinkSpinnerSlot.remove();
                   // Move timer to right side of header
                   if (_liveThinkTimerEl && elapsed) {
-                    _liveThinkTimerEl.textContent = elapsed + 's';
+                    _liveThinkTimerEl.textContent = _formatThinkStats(elapsed, _liveThinkTokenCount);
                     _liveThinkTimerEl.style.marginLeft = 'auto';
                     _liveThinkTimerEl.style.marginRight = '5px';
                     var _hdrRow = _liveThinkTimerEl.closest('.thinking-header');
@@ -1811,6 +1811,21 @@ import { createStreamRenderer } from './streamingRenderer.js';
                   _sourcesData = json.data; _sourcesType = 'web';
                   _sourcesHtml = _buildSourcesBox(json.data, 'web');
                 }
+              } else if (json.type === 'workspace_rejected') {
+                // Server refused to bind the posted workspace (deleted folder,
+                // file path, sensitive dir, filesystem root). Clear the stored
+                // value so the pill stops claiming a confinement that is not in
+                // effect, and tell the user.
+                const _wsPath = (json.data && json.data.path) || '';
+                import('./workspace.js').then((m) => {
+                  const ws = m.default || m;
+                  if (ws && ws.setWorkspace) ws.setWorkspace('');
+                });
+                uiModule.showToast(
+                  `Workspace ${_wsPath || '(unknown)'} is no longer usable; running without confinement`,
+                  6000
+                );
+                continue;
               } else if (json.type === 'model_fallback') {
                 // Model went offline — switched to fallback
                 var _fbData = json.data || {};
@@ -2018,7 +2033,7 @@ import { createStreamRenderer } from './streamingRenderer.js';
                   cancelAnimationFrame(_thinkTimerRAF);
                   var _elapsed2 = thinkingStartTime ? ((Date.now() - thinkingStartTime) / 1000).toFixed(1) : null;
                   if (_liveThinkHeader) _liveThinkHeader.textContent = 'View thinking process';
-                  if (_liveThinkTimerEl) _liveThinkTimerEl.textContent = _elapsed2 ? _elapsed2 + 's' : '';
+                  if (_liveThinkTimerEl) _liveThinkTimerEl.textContent = _elapsed2 ? _formatThinkStats(_elapsed2, _liveThinkTokenCount) : '';
                   if (_liveThinkSpinnerSlot) _liveThinkSpinnerSlot.remove();
                   // Assign stable IDs
                   var _thinkId2 = 'think-' + Date.now();
@@ -2032,7 +2047,7 @@ import { createStreamRenderer } from './streamingRenderer.js';
                 if (!roundFinalized) {
                   roundFinalized = true;
                   if (spinner && spinner.element) spinner.destroy();
-                  const dt = stripToolBlocks(roundText);
+                  const dt = markdownModule.normalizeThinkingMarkup(stripToolBlocks(roundText));
                   if (dt.trim()) {
                     var _body3 = roundHolder.querySelector('.body');
                     var _contentEl3 = _ensureStreamLayout(_body3);
@@ -2082,10 +2097,11 @@ import { createStreamRenderer } from './streamingRenderer.js';
                 }
                 threadWrap.classList.add('streaming');
                 const toolLabel = _toolLabels[json.tool.toLowerCase()] || json.tool;
+                const toolIcon = _toolIcons[json.tool.toLowerCase()] || '\u25B6';
                 const node = document.createElement('div')
                 node.className = 'agent-thread-node running';
                 const cmdHtml = cmd ? `<pre class="agent-thread-cmd">${esc(cmd)}</pre>` : '';
-                node.innerHTML = `<div class="agent-thread-dot"></div><div class="agent-thread-header"><span class="agent-thread-icon">\u25B6</span><span class="agent-thread-tool">${esc(toolLabel)}</span><span class="agent-thread-wave">▁▂▃</span></div><div class="agent-thread-content">${cmdHtml}</div>`;
+                node.innerHTML = `<div class="agent-thread-dot"></div><div class="agent-thread-header"><span class="agent-thread-icon">${toolIcon}</span><span class="agent-thread-tool">${esc(toolLabel)}</span><span class="agent-thread-wave">▁▂▃</span></div><div class="agent-thread-content">${cmdHtml}</div>`;
                 // Expand/collapse via delegated click handler (init at module bottom).
                 threadWrap.appendChild(node);
                 currentToolBubble = node;
@@ -2755,61 +2771,6 @@ import { createStreamRenderer } from './streamingRenderer.js';
         // Attach footer to the last visible bubble (roundHolder for multi-round agent, holder for single)
         const footerTarget = (roundHolder && roundHolder !== holder && roundHolder.style.display !== 'none') ? roundHolder : holder;
         footerTarget.appendChild(createMsgFooter(footerTarget));
-        // Capture any checklist this message produced as the current plan — both
-        // the initial proposal AND restated progress during execution. Keeps the
-        // stored plan (and the docked plan window) in sync with the latest state.
-        if (accumulated && _CHECKLIST_RE.test(accumulated)) {
-          _setStoredPlan(accumulated);
-        }
-        // Plan mode: the agent has proposed a plan — offer to approve & execute it.
-        // Approving re-sends with plan_mode suppressed (full tools) for one turn.
-        if (planTurn && accumulated.trim()) {
-          const _planText = accumulated;
-          const _runApproved = () => {
-            _approveWrap.remove();
-            _forcePlanOff = true;
-            // Persist the approved plan for THIS chat so it's (a) re-sent and
-            // pinned in context every execution turn, and (b) re-openable via the
-            // plan-button menu. Do this BEFORE flipping the toggle, since the menu
-            // intercept keys off a stored plan existing.
-            _setStoredPlan(_planText);
-            // Approving exits plan mode for good — turn it OFF directly (NOT via
-            // the button's click, which would now open the plan menu instead of
-            // toggling) so execution and every follow-up keep full write tools.
-            try { if (window._setPlanMode) window._setPlanMode(false); } catch (_) {}
-            const _inp = el('message');
-            if (_inp) {
-              _inp.value = 'Approved — execute the plan. The full approved checklist is pinned '
-                + 'for you under "## ACTIVE PLAN"; do NOT go looking for it in tasks, notes, or '
-                + 'memory. Work through it in order, and after each step call the update_plan tool '
-                + 'with the full checklist and that step marked `- [x]`. Do the next unchecked item '
-                + 'until all are done.';
-              _inp.dispatchEvent(new Event('input'));
-            }
-            // Show a clean bubble; the full instruction still goes to the model.
-            _displayOverride = 'Approved the plan.';
-            handleChatSubmit({ preventDefault() {} });
-          };
-          var _approveWrap = document.createElement('div');
-          _approveWrap.className = 'plan-approve-bar';
-          const _approveBtn = document.createElement('button');
-          _approveBtn.type = 'button';
-          _approveBtn.className = 'plan-approve-btn';
-          _approveBtn.textContent = 'Approve & Run';
-          _approveBtn.addEventListener('click', _runApproved);
-          // Open the plan in a draggable, side-dockable window (reuses the
-          // shared modal framework). Approving from the window runs it too.
-          const _openBtn = document.createElement('button');
-          _openBtn.type = 'button';
-          _openBtn.className = 'plan-open-btn';
-          _openBtn.textContent = 'Open in window';
-          _openBtn.addEventListener('click', () => {
-            planWindowModule.openPlanWindow(_planText, _runApproved);
-          });
-          _approveWrap.appendChild(_approveBtn);
-          _approveWrap.appendChild(_openBtn);
-          footerTarget.appendChild(_approveWrap);
-        }
         // Add "View Report" link for completed research
         if (_researchingStreamIds.has(streamSessionId)) {
           _appendViewReportLink(footerTarget, streamSessionId);
@@ -3067,6 +3028,7 @@ import { createStreamRenderer } from './streamingRenderer.js';
     } finally {
       clearResponseTimeout();
       clearProcessingProbe();
+      clearFirstTokenWaitTimers();
       // Streaming done — let screen readers announce the settled response.
       const _chatLogDone = document.getElementById('chat-history');
       if (_chatLogDone) _chatLogDone.setAttribute('aria-busy', 'false');
@@ -3445,7 +3407,7 @@ import { createStreamRenderer } from './streamingRenderer.js';
     };
 
     const renderDelta = () => {
-      const dt = stripToolBlocks(roundText);
+      const dt = markdownModule.normalizeThinkingMarkup(stripToolBlocks(roundText));
       contentDiv.innerHTML = markdownModule.mdToHtml(markdownModule.squashOutsideCode(dt));
       uiModule.scrollHistory();
     };
@@ -3930,7 +3892,9 @@ import { createStreamRenderer } from './streamingRenderer.js';
 
     // Also submit on Enter (without shift)
     editor.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+      const isMobile = window.innerWidth <= 768
+
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !isMobile) {
         e.preventDefault();
         saveBtn.click();
       }
@@ -3938,9 +3902,11 @@ import { createStreamRenderer } from './streamingRenderer.js';
   }
 
   /**
-   * Resend a user message — truncates history to that point and resubmits.
+   * Resend a user message. Normal resend appends a fresh copy at the end of
+   * the current thread; regenerate flows can opt into replacing from here.
    */
-  export async function resendUserMessage(userMsgElement) {
+  export async function resendUserMessage(userMsgElement, opts = {}) {
+    const replaceFromHere = Boolean(opts && opts.replaceFromHere);
     const box = document.getElementById('chat-history');
     const allMsgs = Array.from(box.querySelectorAll('.msg'));
     const msgIndex = allMsgs.indexOf(userMsgElement);
@@ -3986,25 +3952,28 @@ import { createStreamRenderer } from './streamingRenderer.js';
     const sessionId = sessionModule.getCurrentSessionId();
     if (!sessionId) return;
 
-    // Truncate backend to keep everything before this user message
-    const keepCount = msgIndex;
     try {
-      await fetch(`${API_BASE}/api/session/${sessionId}/truncate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ keep_count: keepCount })
-      });
+      if (replaceFromHere) {
+        // Regenerate flows intentionally trim history to this point before
+        // resubmitting. The plain "Resend message" action must not do this.
+        const keepCount = msgIndex;
+        await fetch(`${API_BASE}/api/session/${sessionId}/truncate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ keep_count: keepCount })
+        });
 
-      // Drop the AI replies after the user message but KEEP the user bubble
-      // itself (so its photo stays visible). Then suppress the new user
-      // bubble that send would otherwise add — same pattern as regenerate.
-      let sibling = userMsgElement.nextSibling;
-      while (sibling) {
-        const next = sibling.nextSibling;
-        sibling.remove();
-        sibling = next;
+        // Drop the AI replies after the user message but KEEP the user bubble
+        // itself (so its photo stays visible). Then suppress the new user
+        // bubble that send would otherwise add — same pattern as regenerate.
+        let sibling = userMsgElement.nextSibling;
+        while (sibling) {
+          const next = sibling.nextSibling;
+          sibling.remove();
+          sibling = next;
+        }
+        _hideUserBubble = true;
       }
-      _hideUserBubble = true;
       _pendingRegenAttachments = _ids;
 
       // Resubmit
@@ -4538,6 +4507,15 @@ import { createStreamRenderer } from './streamingRenderer.js';
    * Delete an AI message and its preceding user message from the conversation.
    */
   export async function deleteMessage(msgElement) {
+    if (uiModule && uiModule.styledConfirm) {
+      const ok = await uiModule.styledConfirm('Delete this message?', {
+        confirmText: 'Delete',
+        cancelText: 'Cancel',
+        danger: true,
+      });
+      if (!ok) return;
+    }
+
     const box = document.getElementById('chat-history');
     const allMsgs = Array.from(box.querySelectorAll('.msg'));
     const clickedIndex = allMsgs.indexOf(msgElement);

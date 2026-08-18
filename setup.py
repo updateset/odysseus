@@ -12,19 +12,25 @@ import subprocess
 import sys
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+sys.path.insert(0, BASE_DIR)
+from src.constants import (
+    DATA_DIR, AUTH_FILE, UPLOAD_DIR, PERSONAL_DIR, PERSONAL_UPLOADS_DIR,
+    TTS_CACHE_DIR, GENERATED_IMAGES_DIR, DEEP_RESEARCH_DIR, CHROMA_DIR,
+    RAG_DIR, MEMORY_VECTORS_DIR, PASSWORD_MIN_LENGTH,
+)
+from core.auth import RESERVED_USERNAMES
 
 DIRS = [
     DATA_DIR,
-    os.path.join(DATA_DIR, "uploads"),
-    os.path.join(DATA_DIR, "personal_docs"),
-    os.path.join(DATA_DIR, "personal_uploads"),
-    os.path.join(DATA_DIR, "tts_cache"),
-    os.path.join(DATA_DIR, "generated_images"),
-    os.path.join(DATA_DIR, "deep_research"),
-    os.path.join(DATA_DIR, "chroma"),
-    os.path.join(DATA_DIR, "rag"),
-    os.path.join(DATA_DIR, "memory_vectors"),
+    UPLOAD_DIR,
+    PERSONAL_DIR,
+    PERSONAL_UPLOADS_DIR,
+    TTS_CACHE_DIR,
+    GENERATED_IMAGES_DIR,
+    DEEP_RESEARCH_DIR,
+    CHROMA_DIR,
+    RAG_DIR,
+    MEMORY_VECTORS_DIR,
     os.path.join(BASE_DIR, "logs"),
 ]
 
@@ -54,14 +60,22 @@ def _prompt_admin_credentials():
     print("  (Press Enter to accept defaults)")
     print()
 
-    username = input("  Username [admin]: ").strip().lower()
-    if not username:
-        username = "admin"
+    while True:
+        username = input("  Username [admin]: ").strip().lower()
+        if not username:
+            username = "admin"
+        if username in RESERVED_USERNAMES:
+            print(f"  '{username}' is a reserved username. Choose another.")
+            continue
+        break
 
     while True:
         password = getpass.getpass("  Password: ")
         if not password:
             print("  Password cannot be empty.")
+            continue
+        if len(password) < PASSWORD_MIN_LENGTH:
+            print(f"  Password must be at least {PASSWORD_MIN_LENGTH} characters.")
             continue
         confirm = getpass.getpass("  Confirm password: ")
         if password != confirm:
@@ -74,7 +88,7 @@ def _prompt_admin_credentials():
 
 def create_default_admin():
     """Create an initial admin user if none exists."""
-    auth_path = os.path.join(DATA_DIR, "auth.json")
+    auth_path = AUTH_FILE
     if os.path.exists(auth_path):
         print("  [skip] auth.json already exists")
         return "exists"
@@ -88,8 +102,13 @@ def create_default_admin():
         password = os.getenv("ODYSSEUS_ADMIN_PASSWORD", "").strip()
 
         if username and password:
-            # Both provided via env — use them directly
-            pass
+            # Both provided via env — validate before using
+            if username in RESERVED_USERNAMES:
+                print(f"  [error] ODYSSEUS_ADMIN_USER '{username}' is a reserved username")
+                return "failed"
+            if len(password) < PASSWORD_MIN_LENGTH:
+                print(f"  [error] ODYSSEUS_ADMIN_PASSWORD must be at least {PASSWORD_MIN_LENGTH} characters")
+                return "failed"
         elif sys.stdin.isatty() and not os.getenv("ODYSSEUS_SKIP_ADMIN_PROMPT"):
             # Interactive terminal — ask the user
             username, password = _prompt_admin_credentials()

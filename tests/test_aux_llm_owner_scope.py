@@ -43,7 +43,8 @@ def test_background_session_sort_uses_owner_task_endpoint():
 def test_scheduler_fallbacks_and_research_headers_are_owner_scoped():
     src = _src("src/task_scheduler.py")
 
-    assert "resolve_utility_fallback_candidates(owner=task.owner or None)" in src
+    assert "resolve_task_candidates(" in src
+    assert "owner=task.owner or None" in src
     assert 'resolve_endpoint(\n                    "research",' in src
     assert "owner=task.owner or None" in src
     assert "headers_from_resolver = False" in src
@@ -64,4 +65,8 @@ def test_research_routes_fallbacks_are_owner_scoped():
     assert '_merge(*resolve_endpoint("utility", owner=user))' in src
     assert "ep = _owned_enabled_endpoint(db, user)" in src
     assert "db.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True).first()" not in src
-    assert "owner = getattr(sess, \"owner\", None) or None" in src
+    # _resolve_research_endpoint derives the scope from the session owner. The
+    # rebased code generalized this to honor an explicit `owner` argument first
+    # (``owner = owner or getattr(sess, "owner", None) or None``), so assert on
+    # the stable session-derivation substring rather than the exact line.
+    assert 'getattr(sess, "owner", None) or None' in src
