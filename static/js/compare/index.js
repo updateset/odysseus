@@ -73,6 +73,45 @@ function isCompareActive() {
   return state.isActive;
 }
 
+function _compareModeLabel() {
+  return ({ search: ' search providers', agent: ' agents', research: ' research models' }[state._compareMode] || ' models');
+}
+
+function _setToolbarMode(mode, syncModeTools = !state.isActive) {
+  const target = mode === 'agent' ? 'agent' : 'chat';
+  const toggleState = Storage.loadToggleState();
+  toggleState.mode = target;
+  Storage.saveToggleState(toggleState);
+  const agentBtn = document.getElementById('mode-agent-btn');
+  const chatBtn = document.getElementById('mode-chat-btn');
+  const modeToggle = agentBtn?.closest('.mode-toggle') || chatBtn?.closest('.mode-toggle') || document.querySelector('.mode-toggle');
+  if (agentBtn && chatBtn) {
+    agentBtn.classList.toggle('active', target === 'agent');
+    chatBtn.classList.toggle('active', target === 'chat');
+    agentBtn.setAttribute('aria-pressed', target === 'agent' ? 'true' : 'false');
+    chatBtn.setAttribute('aria-pressed', target === 'chat' ? 'true' : 'false');
+  }
+  if (modeToggle) {
+    modeToggle.classList.toggle('mode-chat', target === 'chat');
+    modeToggle.classList.toggle('mode-right', target === 'chat');
+  }
+  if (syncModeTools) {
+    document.querySelectorAll('[data-mode-tool]').forEach(b => { b.style.display = target === 'agent' ? '' : 'none'; });
+  }
+}
+
+function _syncCompareModeFromToolbar(mode) {
+  if (!state.isActive) return;
+  state._compareMode = mode === 'agent' ? 'agent' : 'chat';
+  _setToolbarMode(state._compareMode, false);
+  const headerLabel = document.querySelector('.compare-header-label');
+  if (headerLabel) {
+    headerLabel.textContent = 'Comparing' + _compareModeLabel() + (state._blindMode ? ' (blind)' : '') + ' · ' + state._timeout + 's timeout';
+  }
+  const evalWrap = document.getElementById('cmp-eval-wrap');
+  if (evalWrap && typeof evalWrap._renderItems === 'function') evalWrap._renderItems();
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // ── closeCompare ──
 // ────────────────────────────────────────────────────────────────────────────
@@ -170,12 +209,7 @@ async function deactivate(teardown) {
   });
 
   // Restore agent/chat mode to what it was before compare
-  const _ts = Storage.loadToggleState();
-  _ts.mode = state._savedMode;
-  Storage.saveToggleState(_ts);
-  const _ab2 = document.getElementById('mode-agent-btn'), _cb2 = document.getElementById('mode-chat-btn');
-  if (_ab2 && _cb2) { _ab2.classList.toggle('active', state._savedMode === 'agent'); _cb2.classList.toggle('active', state._savedMode === 'chat'); }
-  document.querySelectorAll('[data-mode-tool]').forEach(b => { b.style.display = state._savedMode === 'agent' ? '' : 'none'; });
+  _setToolbarMode(state._savedMode, true);
 
   // Delete unsaved sessions, then reload
   if (teardown) {
@@ -210,7 +244,9 @@ async function _buildCompareUI() {
     for (let i = 0; i < n; i++) {
       const m = state._selectedModels[i];
       const fd = new FormData();
-      fd.append('name', '[CMP] ' + modelShorts[i]);
+      // Blind mode: name the session by its neutral slot so the sidebar /
+      // GET /api/sessions can't de-anonymize the comparison (issue #1285).
+      fd.append('name', '[CMP] ' + (state._blindMode ? 'Model ' + _slotChar(i) : modelShorts[i]));
       fd.append('endpoint_url', m.endpoint || '');
       fd.append('model', m.model || '');
       if (m.endpointId) {
@@ -256,19 +292,30 @@ async function _buildCompareUI() {
     if (el) state._savedIndicatorDisplay[id] = el.style.display;
   });
 
-  // 5. Save current mode and lock to the right one for this compare type
+  // 5. Save current mode and seed the toolbar for this compare type.
   const _toggleState = Storage.loadToggleState();
   state._savedMode = _toggleState.mode || 'chat';
   const _targetMode = (state._compareMode === 'agent') ? 'agent' : 'chat';
-  _toggleState.mode = _targetMode;
-  Storage.saveToggleState(_toggleState);
+  _setToolbarMode(_targetMode, false);
   const _ab = document.getElementById('mode-agent-btn'), _cb = document.getElementById('mode-chat-btn');
+  let _modeCleanup = null;
+  const _onCompareModeClick = (ev) => {
+    ev.stopPropagation();
+    ev.stopImmediatePropagation();
+    _syncCompareModeFromToolbar(ev.currentTarget === _ab ? 'agent' : 'chat');
+  };
   if (_ab && _cb) {
-    _ab.classList.toggle('active', _targetMode === 'agent');
-    _cb.classList.toggle('active', _targetMode === 'chat');
+    _ab.addEventListener('click', _onCompareModeClick, true);
+    _cb.addEventListener('click', _onCompareModeClick, true);
+    _modeCleanup = document.createElement('span');
+    _modeCleanup.style.display = 'none';
+    _modeCleanup._cleanup = () => {
+      _ab.removeEventListener('click', _onCompareModeClick, true);
+      _cb.removeEventListener('click', _onCompareModeClick, true);
+    };
   }
   const _modeToggle = document.querySelector('.mode-toggle');
-  if (_modeToggle) { _modeToggle.style.pointerEvents = 'none'; _modeToggle.style.opacity = '0.4'; }
+  if (_modeToggle) { _modeToggle.style.pointerEvents = ''; _modeToggle.style.opacity = ''; }
 
   // 6. Force tool toggles per compare mode
   disableToolToggles();
@@ -287,6 +334,7 @@ async function _buildCompareUI() {
   // 7. Hide existing chat container children (preserves event listeners)
   const container = document.getElementById('chat-container');
   state._compareElements = [];
+  if (_modeCleanup) state._compareElements.push(_modeCleanup);
   Array.from(container.children).forEach(child => {
     if (child.style.display === 'none') return;
     child.dataset.cmpHidden = '1';
@@ -300,9 +348,9 @@ async function _buildCompareUI() {
   headerBar.className = 'compare-header-bar';
   headerBar.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:6px 10px;flex-shrink:0;';
   const headerLabel = document.createElement('span');
+  headerLabel.className = 'compare-header-label';
   headerLabel.style.cssText = 'font-size:10px;font-weight:400;color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;';
-  const _modeLabel = ({ search: ' search providers', agent: ' agents', research: ' research models' }[state._compareMode] || ' models');
-  headerLabel.textContent = 'Comparing' + _modeLabel + (state._blindMode ? ' (blind)' : '') + ' · ' + state._timeout + 's timeout';
+  headerLabel.textContent = 'Comparing' + _compareModeLabel() + (state._blindMode ? ' (blind)' : '') + ' · ' + state._timeout + 's timeout';
   // Left side: the Compare tool icon (two side-by-side panes, matching the
   // rail/sidebar icon) + the label. Other tool headers carry their icon; this
   // one was missing it.
@@ -473,7 +521,7 @@ async function _buildCompareUI() {
   }
   const msgTA = document.getElementById('message');
   if (msgTA) {
-    msgTA.placeholder = 'Enter prompt for all models...';
+    msgTA.placeholder = window.matchMedia('(max-width: 767px)').matches ? '' : 'Enter prompt for all models...';
     requestAnimationFrame(() => msgTA.focus());
   }
 
@@ -889,8 +937,7 @@ async function _executeCompare(message) {
     let sharedSearchContext = null;
     let sharedSearchSources = null;
     const webChk = document.getElementById('web-toggle');
-    const toggleState = Storage.loadToggleState();
-    const isAgentMode = (toggleState.mode || 'chat') === 'agent';
+    const isAgentMode = state._compareMode === 'agent';
     const webOn = webChk && webChk.checked;
     // In agent mode, web_search is a tool (handled per-pane); in chat mode, pre-search and share
     if (webOn && !isAgentMode) {
@@ -1088,6 +1135,7 @@ function _exportPrint() {
   // the system print dialog — user can pick "Save as PDF" from there.
   const w = window.open('', '_blank');
   if (!w) return;
+  try { w.opener = null; } catch (_) {}
   const escape = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const html = '<!doctype html><meta charset="utf-8"><title>Compare export</title>' +
     '<style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:780px;margin:32px auto;padding:0 24px;line-height:1.55;color:#222}' +
@@ -1195,6 +1243,15 @@ function _setupEvalPicker() {
 
   function _renderItems() {
     const mode = state._compareMode || 'chat';
+    const label = btn.querySelector('.cmp-eval-label');
+    if (label) {
+      label.textContent = ({
+        agent: 'Agent prompts',
+        chat: 'Chat prompts',
+        search: 'Search prompts',
+        research: 'Research prompts'
+      }[mode] || 'Eval prompts');
+    }
     // research/html aren't first-class compare types — fall back gracefully
     const key = EVAL_PROMPTS[mode] ? mode
       : (mode === 'research' ? 'search' : 'chat');
@@ -1255,8 +1312,10 @@ function _setupEvalPicker() {
   };
   document.addEventListener('click', _onDocClick);
 
+  _renderItems();
   wrap.appendChild(btn);
   wrap.appendChild(menu);
+  wrap._renderItems = _renderItems;
   inputTop.appendChild(wrap);
 
   // Expected-answer chip — placed above the chat-input-bar (outside it), so
